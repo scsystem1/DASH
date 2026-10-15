@@ -8,6 +8,9 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from core.robust_surrogate import RobustNLLSurrogate, consume_predictions, update_weights, gaussian_log_ei
+from scipy.special import logsumexp
+
 import numpy as np
 from langchain_core.messages import AIMessage
 
@@ -197,6 +200,11 @@ def _effective_autobo_surrogate_pool(
 ) -> list[str]:
     if not switching_enabled:
         return [_initial_autobo_active_model(problem_spec=problem_spec, settings=settings, switching_enabled=False)]
+    if _robust_nll_enabled(settings):
+        gps = HPO_CONTINUOUS_GP_SURROGATE_POOL if _is_hpo_problem(problem_spec) else [
+            "gp_indicator_matern52", "gp_exp_hamming_matern52", "gp_indicator_matern32",
+        ]
+        return list(gps) + ["catboost"]
     configured = [
         str(model_id).strip()
         for model_id in (list(getattr(settings, "autobo_surrogate_pool", [])) or [])
@@ -369,6 +377,8 @@ def get_eligible_surrogate_specs(
 
 
 def _surrogate_min_observations(spec: SurrogateSpec, settings) -> int:
+    if _robust_nll_enabled(settings):
+        return 0
     if spec.surrogate_key == "catboost":
         return max(1, int(getattr(settings, "autobo_catboost_min_obs", 12) or 12))
     if spec.surrogate_key == "deep_ensemble":
@@ -443,9 +453,16 @@ def _autobo_acquisition_function_key(settings) -> str:
         return "qlog_ei"
     if not _surrogate_switching_enabled(settings):
         return "ensemble_af" if bool(getattr(settings, "ensemble_af", True)) else "qlog_ei"
-    if bool(getattr(settings, "ensemble_sur", True)):
+    if bool(getattr(settings, "ensemble_sur", True)) and not _robust_nll_enabled(settings):
         return "ensemble_sur"
     return "ensemble_af" if bool(getattr(settings, "ensemble_af", True)) else "qlog_ei"
+
+
+def _robust_nll_enabled(settings) -> bool:
+    strategy = str(getattr(settings, "autobo_surrogate_strategy", "robust_nll"))
+    if strategy not in {"robust_nll", "legacy"}:
+        raise ValueError(f"Unknown surrogate strategy: {strategy}")
+    return _surrogate_switching_enabled(settings) and strategy == "robust_nll"
 
 
 def _surrogate_switching_enabled(settings) -> bool:
@@ -619,6 +636,7 @@ def run_autobo_iteration(
     autobo_state = _resolve_autobo_state(state.get("autobo_state", {}), settings)
     zero_llm_mode = zero_llm_ablation_enabled(settings)
     switching_enabled = _surrogate_switching_enabled(settings)
+    robust_nll = _robust_nll_enabled(settings)
     observations = list(state.get("observations", []))
     problem_spec = state.get("problem_spec", {})
     variables = problem_spec.get("variables", [])
@@ -747,7 +765,7 @@ def run_autobo_iteration(
         if zero_llm_mode:
             feature_spec = {}
             autobo_state = {**autobo_state, "deep_ensemble_feature_spec": feature_spec}
-        elif len(deduped) >= de_min:
+        elif de_specs and len(deduped) >= de_min:
             feature_spec = _get_deep_ensemble_feature_spec(
                 state=state,
                 llm=llm,
@@ -790,6 +808,9 @@ def run_autobo_iteration(
         last_eval_n=last_eval_n,
         eval_interval=eval_interval,
     )
+    if robust_nll:
+        should_trigger = False
+        trigger_reason = "robust_nll"
     if not switching_enabled:
         should_trigger = False
         trigger_reason = "switch_surrogate_disabled"
@@ -941,7 +962,7 @@ def run_autobo_iteration(
             gated_out_models=gated_out_models,
             composite=composite,
             tracker=tracker,
-            trigger_reason=trigger_reason if (should_trigger or not fitted_ids) else "no_trigger",
+            trigger_reason=trigger_reason if (robust_nll or should_trigger or not fitted_ids) else "no_trigger",
             should_trigger=should_trigger,
             fitted_ids=fitted_ids,
             shortlist_limit=shortlist_limit,
@@ -952,7 +973,7 @@ def run_autobo_iteration(
     active_model = None
     active_spec = spec_lookup.get(active_model_id) or _surrogate_spec_for_model_id(active_model_id)
     primary_torch_device = _primary_torch_device(settings)
-    if active_spec is not None:
+    if active_spec is not None and not robust_nll:
         try:
             active_model = _create_surrogate_from_spec(active_spec, variables, feature_spec, torch_device=primary_torch_device)
             active_model.fit(scored_candidates, y_model)
@@ -969,6 +990,42 @@ def run_autobo_iteration(
                 "stage": "shortlist",
                 "torch_device": primary_torch_device,
             }
+
+    if robust_nll:
+        model_ids = [spec.model_id for spec in all_specs]
+        cache = autobo_state.get("robust_nll", {})
+        if (cache.get("model_ids") != model_ids
+                or cache.get("direction", direction) != direction
+                or int(cache.get("observed_count", 0)) > len(observations)):
+            cache = {}
+        history = consume_predictions(cache, observations, candidate_to_key, direction)
+        previous = cache.get("weights", [1.0 / len(model_ids)] * len(model_ids))
+        weights = np.asarray(previous, dtype=float)
+        if len(observations) > int(cache.get("observed_count", -1)):
+            weights = update_weights(history, previous, float(getattr(settings, "robust_nll_kl_penalty", 1.0)))
+
+        def mixture_factory(device=primary_torch_device):
+            factories = [
+                lambda spec=spec: _create_surrogate_from_spec(spec, variables, None, torch_device=device)
+                for spec in all_specs
+            ]
+            return RobustNLLSurrogate(factories, weights)
+
+        active_model = mixture_factory()
+        active_model.fit(scored_candidates, y_model)
+        active_model_id = "robust_nll"
+        fitted_ids = model_ids
+        fit_results.update({mid: {"success": True, "error": "", "stage": "robust_nll"} for mid in model_ids})
+        autobo_state["robust_nll"] = {
+            "model_ids": model_ids, "weights": weights.tolist(), "history": history,
+            "observed_count": len(observations), "direction": direction, "pending": {},
+        }
+        switch_info.update({
+            "to": "robust_nll", "switch_type": "robust_nll", "switch_subtype": "mixture",
+            "weights": dict(zip(model_ids, weights.tolist())),
+            "reason": "Rolling prequential robust NLL mixture update.",
+            "decision_reason": "Rolling prequential robust NLL mixture update.",
+        })
 
     if active_model is None and fitted_ids and switching_enabled:
         if composite:
@@ -1018,7 +1075,7 @@ def run_autobo_iteration(
                     "stage": "shortlist_fallback",
                     "torch_device": primary_torch_device,
                 }
-    elif not should_trigger:
+    elif not should_trigger and not robust_nll:
         shortlist_only_model_id = active_model_id
 
     shortlist_raw = []
@@ -1062,7 +1119,10 @@ def run_autobo_iteration(
     if active_model is not None:
         active_spec = spec_lookup.get(active_model_id) or _surrogate_spec_for_model_id(active_model_id)
         refit_model_factory = None
-        if active_spec is not None:
+        if robust_nll:
+            refit_model_factory = mixture_factory
+            cpu_refit_model_factory = lambda: mixture_factory("cpu")
+        elif active_spec is not None:
             refit_model_factory = lambda spec=active_spec, ss=variables, fs=feature_spec, td=primary_torch_device: _create_surrogate_from_spec(spec, ss, fs, torch_device=td)
             cpu_refit_model_factory = lambda spec=active_spec, ss=variables, fs=feature_spec: _create_surrogate_from_spec(spec, ss, fs, torch_device="cpu")
         else:
@@ -1142,6 +1202,15 @@ def run_autobo_iteration(
         for index, item in enumerate(shortlist):
             item["autobo_rank"] = index + 1
         status = "fallback"
+    if robust_nll:
+        # Forecast the actual selectable points using the unfantasized models.
+        candidates = [item["candidate"] for item in shortlist]
+        means, stds = active_model.component_predictions(candidates, observation_noise=True)
+        autobo_state["robust_nll"]["pending"] = {
+            candidate_to_key(candidate): {"mean": means[:, i].tolist(), "std": stds[:, i].tolist()}
+            for i, candidate in enumerate(candidates)
+        }
+
     calibration_entry = {
         "iteration": int(state.get("iteration", 0)),
         "active_model": active_model_id,
@@ -1149,7 +1218,7 @@ def run_autobo_iteration(
             model_id: _recent_calibration_coverage(getattr(tracker, "coverage_history", {}).get(model_id, []))
             for model_id in fitted_ids
         },
-        "trigger_reason": trigger_reason if (should_trigger or not fitted_ids) else "no_trigger",
+        "trigger_reason": trigger_reason if (robust_nll or should_trigger or not fitted_ids) else "no_trigger",
     }
     fitness_entry = {
         model_id: {
@@ -1193,9 +1262,10 @@ def run_autobo_iteration(
             "active_model": resolved_components.get("surrogate_model") or active_model_id,
             "active_model_internal": active_model_id,
             "fit_results": fit_results,
-            "trigger_reason": trigger_reason if (should_trigger or not fitted_ids) else "no_trigger",
+            "trigger_reason": trigger_reason if (robust_nll or should_trigger or not fitted_ids) else "no_trigger",
             "switch_info": switch_info,
             "switch_decision": switch_decision_payload,
+            "surrogate_weights": switch_info.get("weights", {}),
             "candidate_pool_source": "dataset" if dataset_candidate_pool is not None else "search_space",
             "shortlist_prefilter_size": acquisition_flow.last_prefilter_size,
             "shortlist_hallucination_mode": acquisition_flow.hallucination_mode,
@@ -4319,6 +4389,11 @@ def _score_candidate_pool(
     direction: str,
     seed: int,
 ) -> dict[str, Any]:
+    if isinstance(surrogate, RobustNLLSurrogate):
+        return _score_candidate_pool_with_af(
+            af_key="qlogei", surrogate=surrogate, candidate_pool=candidate_pool,
+            best_f_scaled=best_f_scaled, y_mean=y_mean, y_std=y_std, direction=direction, seed=seed,
+        )
     pred_mean_model, pred_std_model = surrogate.predict(candidate_pool)
     pred_mean_model = np.asarray(pred_mean_model, dtype=float)
     pred_std_model = np.maximum(np.asarray(pred_std_model, dtype=float), 1e-6)
@@ -4361,11 +4436,29 @@ def _score_candidate_pool_with_af(
     ucb_beta: float | None = None,
 ) -> dict[str, Any]:
     normalized_af = str(af_key or "qlogei").strip().lower()
-    pred_mean_model, pred_std_model = surrogate.predict(candidate_pool)
+    if isinstance(surrogate, RobustNLLSurrogate):
+        means, stds = surrogate.component_predictions(candidate_pool)
+        pred_mean_model = surrogate.weights @ means
+        pred_std_model = np.sqrt(surrogate.weights @ (stds**2 + (means - pred_mean_model)**2))
+    else:
+        pred_mean_model, pred_std_model = surrogate.predict(candidate_pool)
     pred_mean_model = np.asarray(pred_mean_model, dtype=float)
     pred_std_model = np.maximum(np.asarray(pred_std_model, dtype=float), 1e-6)
 
-    if normalized_af == "qucb":
+    if isinstance(surrogate, RobustNLLSurrogate) and normalized_af != "qucb":
+        if normalized_af == "ts":
+            index = np.random.default_rng(seed).choice(len(surrogate.models), p=surrogate.weights)
+            acq_values = _score_candidate_pool_with_af(
+                af_key="ts", surrogate=surrogate.models[index], candidate_pool=candidate_pool,
+                best_f_scaled=best_f_scaled, y_mean=y_mean, y_std=y_std, direction=direction, seed=seed,
+            )["acquisition"]
+        else:
+            log_eis = np.asarray([
+                gaussian_log_ei(mu, sigma, best_f_scaled)
+                for mu, sigma in zip(means, stds)
+            ])
+            acq_values = logsumexp(log_eis + np.log(surrogate.weights)[:, None], axis=0)
+    elif normalized_af == "qucb":
         beta = max(float(ucb_beta if ucb_beta is not None else 1.0), 0.0)
         sigma_multiplier = float(np.sqrt(beta))
         if isinstance(surrogate, CoCaBOGPSurrogate) and surrogate.model is not None:
@@ -6017,6 +6110,7 @@ def _z_score_for_ci(ci_level: float) -> float:
 def _resolve_autobo_state(autobo_state: dict[str, Any] | None, settings) -> dict[str, Any]:
     current = dict(autobo_state or {})
     return {
+        "robust_nll": dict(current.get("robust_nll", {})),
         "active_model": str(current.get("active_model") or getattr(settings, "autobo_initial_active", "gp_indicator_matern52")),
         "fitness_log": dict(current.get("fitness_log", {})),
         "calibration_log": list(current.get("calibration_log", [])),
