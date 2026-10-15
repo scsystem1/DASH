@@ -56,6 +56,8 @@ class Settings:
     memory_ablation: bool = True
     harness_ablation: bool = True
     switch_surrogate: bool = True
+    autobo_surrogate_strategy: str = "robust_nll"  # legacy: LOOCV hard switching
+    robust_nll_kl_penalty: float = 1.0  # mean log-loss units; larger slows weight changes
     zero_llm_fixed_warm_start_records: list[dict] | None = None
     zero_llm_fixed_warm_start_source_dir: Optional[str] = None
     zero_llm_fixed_warm_start_manifest_path: Optional[str] = None
@@ -66,7 +68,6 @@ class Settings:
             "gp_exp_hamming_matern52",
             "gp_indicator_matern32",
             "catboost",
-            "deep_ensemble",
         ]
     )
     autobo_initial_active: str = "gp_indicator_matern52"

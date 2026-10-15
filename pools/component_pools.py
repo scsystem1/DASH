@@ -641,8 +641,9 @@ class CatBoostSurrogate(BaseSurrogateModel):
             mean = preds
             sigma = np.full_like(mean, 1e-3, dtype=float)
         else:
-            if preds.shape[0] == 2 and preds.shape[1] == len(candidates):
-                preds = preds.T
+            # CatBoost returns (n_candidates, 2), including the ambiguous 2x2 case.
+            if preds.shape != (len(candidates), 2):
+                raise ValueError(f"Unexpected CatBoost prediction shape: {preds.shape}")
             mean = preds[:, 0]
             variance = np.maximum(preds[:, 1], 1e-12)
             sigma = np.sqrt(variance)

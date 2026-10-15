@@ -678,7 +678,6 @@ def test_default_autobo_surrogate_pool_matches_baseline() -> None:
         "gp_exp_hamming_matern52",
         "gp_indicator_matern32",
         "catboost",
-        "deep_ensemble",
     ]
 
 

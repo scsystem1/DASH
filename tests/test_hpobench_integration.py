@@ -257,7 +257,7 @@ def test_hpobench_runtime_uses_continuous_gp_pool_and_records_no_categorical_ker
 
     assert pool[:3] == ["gp_matern52", "gp_matern32", "gp_smk"]
     assert "catboost" in pool
-    assert "deep_ensemble" in pool
+    assert "deep_ensemble" not in pool
     assert not any(model_id.startswith("gp_indicator_") for model_id in pool)
     assert not any(model_id.startswith("gp_exp_hamming_") for model_id in pool)
 
